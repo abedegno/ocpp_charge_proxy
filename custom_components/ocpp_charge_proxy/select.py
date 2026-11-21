@@ -22,17 +22,25 @@ async def async_setup_entry(
     async_add_entities([OCPPChargeProxyCurrentSelect(coordinator, entry)])
 
 
-class OCPPChargeProxyCurrentSelect(CoordinatorEntity[OCPPChargeProxyCoordinator], SelectEntity):
+class OCPPChargeProxyCurrentSelect(
+    CoordinatorEntity[OCPPChargeProxyCoordinator], SelectEntity
+):
     """Select entity for charger current setting."""
 
     _attr_has_entity_name = True
     _attr_name = "Current Amps Setting"
     _attr_options = VALID_CURRENT_OPTIONS
 
-    def __init__(self, coordinator: OCPPChargeProxyCoordinator, entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: OCPPChargeProxyCoordinator, entry: ConfigEntry
+    ) -> None:
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_current_amps_setting"
         self._attr_device_info = get_device_info(entry.entry_id)
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.data.get("mode") != "relay"
 
     @property
     def current_option(self) -> str | None:

@@ -1,12 +1,15 @@
 {
   "domain": "ocpp_charge_proxy",
   "name": "OCPP Charge Proxy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "documentation": "https://github.com/abedegno/ocpp_charge_proxy",
   "dependencies": [],
-  "codeowners": ["@abedegno"],
+  "codeowners": [
+    "@abedegno"
+  ],
   "config_flow": true,
   "integration_type": "device",
   "single_config_entry": true,
-  "iot_class": "local_polling"
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/abedegno/ocpp_charge_proxy/issues"
 }

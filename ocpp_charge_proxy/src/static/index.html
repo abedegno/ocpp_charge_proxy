@@ -97,6 +97,11 @@
         </div>
       </div>
     </div>
+    <p id="relay-status" style="margin-top:24px"></p>
+    <details id="traffic-panel" hidden style="margin-top:24px;text-align:left;max-width:1000px">
+      <summary>Recent OCPP traffic (redacted)</summary>
+      <pre id="traffic" style="overflow:auto;max-height:55vh;font-size:12px"></pre>
+    </details>
     <div class="footer">Auto-refreshes every 10 seconds</div>
     <div class="error" id="error" style="display:none"></div>
   </div>
@@ -118,6 +123,16 @@
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data = await resp.json();
 
+        const relay = data.mode === 'relay';
+        document.getElementById('traffic-panel').hidden = !relay;
+        document.getElementById('relay-status').textContent = relay
+          ? `Relay · Charger ${data.charger_connected ? 'connected' : 'disconnected'} · ${data.frames_forwarded} messages forwarded · ${data.log_dropped} log records lost${data.log_error ? ' · ' + data.log_error : ''}`
+          : 'Emulator mode';
+        if (relay) {
+          const traffic = await fetch('./api/traffic');
+          if (!traffic.ok) throw new Error('Traffic log unavailable');
+          document.getElementById('traffic').textContent = JSON.stringify(await traffic.json(), null, 2);
+        }
         const connected = data.connected_to_server;
         const dot = document.getElementById('conn-dot');
         const connText = document.getElementById('conn-text');

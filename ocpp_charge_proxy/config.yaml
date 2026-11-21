@@ -1,6 +1,6 @@
 name: "OCPP Charge Proxy"
-description: "Virtual OCPP 1.6 chargepoint for smart tariff providers"
-version: "0.1.0"
+description: "OCPP 1.6 emulator and transparent charger relay"
+version: "0.2.0"
 slug: "ocpp_charge_proxy"
 url: "https://github.com/abedegno/ocpp_charge_proxy"
 arch:
@@ -12,14 +12,21 @@ homeassistant_api: true
 ingress: true
 panel_icon: "mdi:ev-station"
 panel_title: "OCPP Charge Proxy"
+map:
+  - ssl:ro
 ports:
+  "9000/tcp": null
   "8099/tcp": null
 ports_description:
+  "9000/tcp": "Authenticated OCPP relay (map only in relay mode)"
   "8099/tcp": "Companion integration API"
 discovery:
   - ocpp_charge_proxy
 image: "ghcr.io/abedegno/{arch}-addon-ocpp-charge-proxy"
 options:
+  mode: "emulator"
+  relay_certfile: ""
+  relay_keyfile: ""
   server_hostname: ""
   chargepoint_id: ""
   password: ""
@@ -31,6 +38,9 @@ options:
   initial_energy_wh: 0
   log_level: "info"
 schema:
+  mode: list(emulator|relay)
+  relay_certfile: str?
+  relay_keyfile: str?
   server_hostname: str
   chargepoint_id: str
   password: password

@@ -8,6 +8,13 @@ from typing import Optional
 class SharedState:
     """State shared between the OCPP client and the REST API."""
 
+    mode: str = "emulator"
+    charger_connected: bool = False
+    session_id: Optional[str] = None
+    frames_forwarded: int = 0
+    last_message_at: Optional[str] = None
+    log_dropped: int = 0
+    log_error: Optional[str] = None
     state: str = "Available"
     plugged_in: bool = False
     power_kw: float = 0.0

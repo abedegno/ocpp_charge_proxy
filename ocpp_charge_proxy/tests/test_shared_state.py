@@ -27,10 +27,27 @@ def test_to_dict_includes_all_fields():
     state = SharedState()
     d = state.to_dict()
     expected_keys = {
-        "state", "plugged_in", "power_kw", "voltage", "current_a",
-        "frequency_hz", "power_offered_kw", "energy_kwh",
-        "current_amps_setting", "transaction_id", "connected_to_server",
-        "meter_interval", "power_source", "power_entity_value",
+        "state",
+        "plugged_in",
+        "power_kw",
+        "voltage",
+        "current_a",
+        "frequency_hz",
+        "power_offered_kw",
+        "energy_kwh",
+        "current_amps_setting",
+        "transaction_id",
+        "connected_to_server",
+        "meter_interval",
+        "power_source",
+        "power_entity_value",
         "server_config",
+        "mode",
+        "charger_connected",
+        "session_id",
+        "frames_forwarded",
+        "last_message_at",
+        "log_dropped",
+        "log_error",
     }
     assert set(d.keys()) == expected_keys

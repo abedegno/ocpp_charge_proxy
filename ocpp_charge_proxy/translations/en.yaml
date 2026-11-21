@@ -1,5 +1,14 @@
 ---
 configuration:
+  mode:
+    name: Operating Mode
+    description: Emulator simulates a charger. Relay forwards the real charger's OCPP messages unchanged.
+  relay_certfile:
+    name: Relay TLS Certificate
+    description: Optional certificate chain path under /ssl; requires a matching key.
+  relay_keyfile:
+    name: Relay TLS Private Key
+    description: Matching key path under /ssl. Leave both empty for WS on a trusted LAN.
   server_hostname:
     name: OCPP Server Hostname
     description: >-

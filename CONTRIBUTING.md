@@ -1,121 +1,102 @@
-# Contributing & Release Process
+# Contributing and releases
 
-## Project Structure
+## Layout
 
-```
-ocpp_charge_proxy/                    # HA add-on (Docker container)
-  config.yaml                         # Add-on metadata — contains the version
-  src/                                # Python OCPP client
-  tests/                              # pytest tests
-  CHANGELOG.md                        # User-facing changelog
-  DOCS.md                             # Add-on documentation (shown in HA)
+- `ocpp_charge_proxy/`: independently running HA OS app, Python source, app tests,
+  Dockerfile, s6 scripts, configuration and user documentation.
+- `custom_components/ocpp_charge_proxy/`: companion integration, loaded by Core.
+- `tests/`: companion tests using actual Home Assistant classes.
+- `.github/workflows/`: reusable tests, app lint and image builds.
 
-custom_components/ocpp_charge_proxy/  # HA integration (HACS)
-  manifest.json                       # Integration metadata — contains the version
+Keep the emulator and companion integration when extending relay functionality.
+Never connect tests to a live provider or change a user's charger configuration.
 
-.github/workflows/
-  builder.yaml                        # Builds and pushes Docker images on push to master
-  lint.yaml                           # Runs HA add-on linter
-  test.yaml                           # Runs pytest
-```
+## App development
 
-## Version Numbers
+From the repository root, with Python 3.13 or 3.14 and the OpenSSL command installed:
 
-The add-on and integration versions **must stay in sync**:
-
-| File | Field | Example |
-|------|-------|---------|
-| `ocpp_charge_proxy/config.yaml` | `version` | `"0.1.0"` |
-| `custom_components/ocpp_charge_proxy/manifest.json` | `version` | `"0.1.0"` |
-
-Both use [semver](https://semver.org/):
-- **Patch** (0.1.1) — bug fixes
-- **Minor** (0.2.0) — new features, backward compatible
-- **Major** (1.0.0) — breaking changes
-
-## Release Checklist
-
-1. **Make your changes** on master (or a feature branch merged to master)
-
-2. **Update the changelog** — edit `ocpp_charge_proxy/CHANGELOG.md`:
-   ```markdown
-   ## 0.2.0
-
-   - Description of changes
-   ```
-
-3. **Bump both versions** — they must match:
-   - `ocpp_charge_proxy/config.yaml` → `version: "0.2.0"`
-   - `custom_components/ocpp_charge_proxy/manifest.json` → `"version": "0.2.0"`
-
-4. **Commit**:
-   ```bash
-   git add ocpp_charge_proxy/config.yaml ocpp_charge_proxy/CHANGELOG.md \
-          custom_components/ocpp_charge_proxy/manifest.json
-   git commit -m "release: v0.2.0"
-   ```
-
-5. **Push to master**:
-   ```bash
-   git push origin master
-   ```
-
-6. **Verify CI** — check GitHub Actions:
-   - `Tests` workflow passes (pytest)
-   - `Lint` workflow passes (add-on linter)
-   - `Builder` workflow builds and pushes Docker images to GHCR
-
-7. **Create a GitHub Release** (optional but recommended):
-   ```bash
-   gh release create v0.2.0 --title "v0.2.0" --notes "See CHANGELOG.md"
-   ```
-
-## What Happens on Push
-
-| Workflow | Trigger | Action |
-|----------|---------|--------|
-| `test.yaml` | Push/PR to master | Runs `pytest` |
-| `lint.yaml` | Push/PR to master | Runs HA add-on linter |
-| `builder.yaml` | Push to master | Builds Docker images, pushes to GHCR |
-| `builder.yaml` | PR to master | Test build only (no push) |
-
-## How Users Get Updates
-
-- **Add-on:** HA Supervisor checks the `version` in `config.yaml` against the installed version. When it changes, the user sees an update notification.
-- **Integration:** HACS checks the `version` in `manifest.json`. Users update via HACS > Integrations.
-
-Both update independently but should always be the same version to avoid confusion.
-
-## Development Setup
-
-```bash
-cd ocpp_charge_proxy
+```sh
 python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-pip install pytest pytest-asyncio pytest-aiohttp
-
-# Run tests
-python -m pytest tests/ -v
-
-# Run standalone (outside HA)
-./run_standalone.sh ocpp.example.com CHARGEPOINT_ID PASSWORD
+. .venv/bin/activate
+python -m pip install -r ocpp_charge_proxy/requirements-dev.txt
+python -m pytest ocpp_charge_proxy/tests -q --cov=src --cov-branch --cov-report=term-missing
 ```
 
-## Testing in HA
+Tests use local loopback sockets and queue-backed OCPP peers. Sandboxed runners
+must allow loopback listeners. TLS fixtures generate temporary self-signed test
+certificates with OpenSSL. Do not skip these tests to make restricted networking
+appear to pass.
 
-1. Push changes to GitHub
-2. In HA: **Settings > Add-ons > OCPP Charge Proxy > Rebuild**
-3. For the integration: **HACS > Integrations > OCPP Charge Proxy > Redownload**, then restart HA
+To run standalone, change into `ocpp_charge_proxy/`, then use:
 
-## Security Score
+```sh
+./run_standalone.sh --no-tls localhost:8765 CP001 TEST_PASSWORD
+```
 
-Current score: **8/8**
+The example expects a local mock provider. Use `IO_MODE=relay` and optional
+`IO_RELAY_PORT`, `IO_RELAY_CERTFILE`, `IO_RELAY_KEYFILE` for relay testing.
+Production upstream WSS remains verified. Credentials supplied as shell arguments
+may be visible in process history; use a test account in development.
 
-| Factor | Score |
-|--------|-------|
-| Base | 5 |
-| Custom AppArmor profile (`apparmor.txt`) | +1 |
-| Ingress (`ingress: true`) | +2 |
+## Companion tests
 
-Avoid: `host_network`, `privileged`, `full_access`, `docker_api` (all reduce score).
+Use a separate Python 3.14.2+ environment, matching Core:
+
+```sh
+python3.14 -m venv .venv-ha
+. .venv-ha/bin/activate
+python -m pip install -r requirements-ha-test.txt
+python -m pytest tests -q --cov=custom_components.ocpp_charge_proxy --cov-branch
+```
+
+The pinned Home Assistant version is the compatibility baseline. Tests exercise
+real coordinator/entity/options-flow classes with a local API and an isolated
+HTTP session. They do not boot a complete HA OS/Supervisor installation. Verify
+discovery, installation, upgrades and both modes in a disposable HA instance
+before release. A fake implementation of Home Assistant is not a substitute.
+
+## Coverage and CI
+
+`test.yaml` is reusable and can also be run manually. `builder.yaml` calls it for
+pushes and pull requests. App tests run on Python 3.13/3.14, companion tests use
+Home Assistant 2026.11.1, and coverage reports are uploaded as artifacts. App
+combined line/branch coverage must stay at or above 70%; review missing paths
+rather than adding tests that only repeat implementation details.
+
+Image builds depend on the tests succeeding. PR builds use `--test` and do not
+publish images. Pushes to main/master can publish to GHCR after tests pass.
+`lint.yaml` separately validates app metadata. Do not merge with failing checks.
+
+## Release checklist
+
+1. Work on a feature branch, reproduce reported bugs, add regression coverage and
+   update the user documentation and `ocpp_charge_proxy/CHANGELOG.md`.
+2. Keep `ocpp_charge_proxy/config.yaml` and the integration's `manifest.json`
+   versions in sync. Current prepared release: `0.2.0`.
+3. Run both test suites, shell syntax checks, JSON/YAML checks and `git diff --check`.
+   Obtain independent review before merging.
+4. Build/test the configured aarch64 and amd64 app images. For a local aarch64 build:
+
+   ```sh
+   docker build --build-arg BUILD_FROM=ghcr.io/home-assistant/aarch64-base-python:3.13-alpine3.24 \
+     --build-arg BUILD_ARCH=aarch64 --build-arg BUILD_VERSION=0.2.0 \
+     -t ocpp-charge-proxy:local ocpp_charge_proxy
+   ```
+
+5. Verify a disposable HA OS installation and supervised real-provider behavior
+   where appropriate. Save the charger endpoint and authentication for rollback.
+6. Merge only after CI/review, verify published versioned images for both
+   architectures, then create a release with accurate validation and limitations.
+   Updating a version string alone does not publish an installable app update.
+7. Supervisor offers app updates once the version/image are published. The
+   companion in this combined repository is updated manually by replacing its
+   files and restarting Core. Marketplace distribution would need an
+   integration-only repository.
+
+## Security boundaries
+
+The relay listener requires charger Basic authentication and optionally serves TLS.
+Provider TLS verification stays enabled. Do not expose the unauthenticated internal
+HTTP API. Diagnostic logs are redacted but still contain device/session metadata.
+Do not commit credentials, captures or private keys. A Supervisor security score
+is not evidence of a security audit; no fixed score is claimed here.

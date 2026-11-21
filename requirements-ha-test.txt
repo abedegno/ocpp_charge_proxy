@@ -1,0 +1,6 @@
+# Companion integration tests use the supported HA runtime, separate from the app.
+homeassistant==2026.11.1
+pytest>=8,<10
+pytest-asyncio>=1,<2
+pytest-aiohttp>=1,<2
+pytest-cov>=6,<8

@@ -15,6 +15,9 @@ on:
       - master
 
 jobs:
+  verify:
+    uses: ./.github/workflows/test.yaml
+
   init:
     runs-on: ubuntu-latest
     name: Initialize builds
@@ -24,18 +27,24 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
 
       - name: Get changed files
         id: changed_files
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
-          if git rev-parse HEAD~1 >/dev/null 2>&1; then
-            changed=$(git diff --name-only HEAD~1 HEAD)
+          if [[ -n "$BASE_REF" ]] && git cat-file -e "${BASE_REF}^{commit}" 2>/dev/null; then
+            changed=$(git diff --name-only "$BASE_REF" "$GITHUB_SHA")
           else
             changed=$(git ls-tree -r --name-only HEAD)
           fi
-          echo "all<<EOF" >> $GITHUB_OUTPUT
-          echo "$changed" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          {
+            echo "all<<EOF"
+            echo "$changed"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Find add-on directories
         id: addons
@@ -43,32 +52,28 @@ jobs:
 
       - name: Get changed add-ons
         id: changed_addons
+        env:
+          CHANGED_FILES: ${{ steps.changed_files.outputs.all }}
+          ADDON_PATHS: ${{ steps.addons.outputs.addons }}
         run: |
-          declare -a changed_addons
-          for addon in ${{ steps.addons.outputs.addons }}; do
-            if [[ "${{ steps.changed_files.outputs.all }}" =~ $addon ]]; then
-              for file in ${{ env.MONITORED_FILES }}; do
-                  if [[ "${{ steps.changed_files.outputs.all }}" =~ $addon/$file ]]; then
-                    if [[ ! "${changed_addons[@]}" =~ $addon ]]; then
-                      changed_addons+=("\"${addon}\",");
-                    fi
-                  fi
-              done
-            fi
-          done
-
-          changed=$(echo ${changed_addons[@]} | rev | cut -c 2- | rev)
-
-          if [[ -n ${changed} ]]; then
-            echo "Changed add-ons: $changed";
-            echo "changed=true" >> $GITHUB_OUTPUT;
-            echo "addons=[$changed]" >> $GITHUB_OUTPUT;
-          else
-            echo "No add-on had any monitored files changed (${{ env.MONITORED_FILES }})";
-          fi
+          python3 - <<'PY'
+          import json
+          import os
+          changed = os.environ["CHANGED_FILES"].splitlines()
+          selected = []
+          for addon in os.environ["ADDON_PATHS"].split():
+              for name in os.environ["MONITORED_FILES"].split():
+                  target = f"{addon}/{name}"
+                  if any(path == target or path.startswith(target + "/") for path in changed):
+                      selected.append(addon)
+                      break
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("changed=" + str(bool(selected)).lower() + "\n")
+              output.write("addons=" + json.dumps(selected) + "\n")
+          PY
 
   build:
-    needs: init
+    needs: [init, verify]
     runs-on: ubuntu-latest
     if: needs.init.outputs.changed == 'true'
     name: Build ${{ matrix.arch }} ${{ matrix.addon }} add-on
@@ -92,19 +97,25 @@ jobs:
 
       - name: Check if add-on should be built
         id: check
+        env:
+          INFO_IMAGE: ${{ steps.info.outputs.image }}
+          INFO_ARCHITECTURES: ${{ steps.info.outputs.architectures }}
+          TARGET_ARCH: ${{ matrix.arch }}
+          HEAD_REF: ${{ github.head_ref }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [[ "${{ steps.info.outputs.image }}" == "null" ]]; then
-            echo "Image property is not defined, skipping build"
-            echo "build_arch=false" >> $GITHUB_OUTPUT;
-          elif [[ "${{ steps.info.outputs.architectures }}" =~ ${{ matrix.arch }} ]]; then
-            echo "build_arch=true" >> $GITHUB_OUTPUT;
-            echo "image=$(echo ${{ steps.info.outputs.image }} | cut -d'/' -f3)" >> $GITHUB_OUTPUT;
-            if [[ -z "${{ github.head_ref }}" ]] && [[ "${{ github.event_name }}" == "push" ]]; then
-                echo "BUILD_ARGS=" >> $GITHUB_ENV;
+          if [[ -z "$INFO_IMAGE" || "$INFO_IMAGE" == "null" ]]; then
+            echo "build_arch=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$INFO_ARCHITECTURES" == *"$TARGET_ARCH"* ]]; then
+            {
+              echo "build_arch=true"
+              echo "image=${INFO_IMAGE##*/}"
+            } >> "$GITHUB_OUTPUT"
+            if [[ -z "$HEAD_REF" && "$EVENT_NAME" == "push" ]]; then
+              echo "BUILD_ARGS=" >> "$GITHUB_ENV"
             fi
           else
-            echo "${{ matrix.arch }} is not a valid arch for ${{ matrix.addon }}, skipping build";
-            echo "build_arch=false" >> $GITHUB_OUTPUT;
+            echo "build_arch=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Login to GitHub Container Registry

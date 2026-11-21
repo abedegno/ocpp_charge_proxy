@@ -21,6 +21,42 @@ logger = logging.getLogger("ocpp_charge_proxy")
 BACKOFF_STEPS = [5, 10, 30, 60, 300]
 
 
+async def run_emulator_session(cp, config, persistence, console=None):
+    """Own every task for one connection, including setup and command follow-ups."""
+    receiver = asyncio.create_task(cp.start())
+    tasks = [receiver]
+    try:
+        serial = config.charger_serial or persistence.load_serial_number()
+        boot = asyncio.create_task(
+            cp.send_boot_notification(
+                model=config.charger_model,
+                vendor=config.charger_vendor,
+                serial_number=serial,
+                firmware_version=config.firmware_version,
+            )
+        )
+        tasks.append(boot)
+        await asyncio.wait([receiver, boot], return_when=asyncio.FIRST_COMPLETED)
+        if receiver.done():
+            receiver.result()
+            raise ConnectionError("OCPP receiver ended during registration")
+        interval = await boot
+        tasks.extend(
+            [
+                asyncio.create_task(cp.heartbeat_loop(interval)),
+                asyncio.create_task(cp.meter_values_loop()),
+            ]
+        )
+        if console is not None:
+            tasks.append(asyncio.create_task(console()))
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await cp.shutdown()
+
+
 async def run() -> None:
     config = load_config()
 
@@ -33,8 +69,30 @@ async def run() -> None:
         stream=sys.stdout,
     )
 
+    # Library wire logs can include Basic credentials and ID tags.
+    logging.getLogger("websockets").setLevel(logging.CRITICAL)
+    logging.getLogger("ocpp").setLevel(logging.WARNING)
+
     data_dir = os.environ.get("IO_DATA_DIR", "/data")
     os.makedirs(data_dir, exist_ok=True)
+
+    if config.mode == "relay":
+        from src.relay import RelayServer, TrafficLog
+
+        shared_state = SharedState()
+        async with TrafficLog(os.path.join(data_dir, "relay"), shared_state) as audit:
+            async with RelayServer(config, shared_state, audit):
+                runner = web.AppRunner(create_api_app(shared_state, traffic_log=audit))
+                await runner.setup()
+                try:
+                    await web.TCPSite(runner, "0.0.0.0", 8099).start()
+                    logger.info(
+                        "Transparent relay listening on port %s", config.relay_port
+                    )
+                    await asyncio.Future()
+                finally:
+                    await runner.cleanup()
+        return
 
     logger.info("Starting OCPP Charge Proxy, connecting to %s", config.redacted_url)
 
@@ -43,17 +101,25 @@ async def run() -> None:
     # Seed energy register if initial_energy_wh is set (cleared by s6 run script)
     if config.initial_energy_wh > 0:
         persistence.save_energy_register_wh(config.initial_energy_wh)
-        logger.info("Energy register set to %d Wh from config", config.initial_energy_wh)
+        logger.info(
+            "Energy register set to %d Wh from config", config.initial_energy_wh
+        )
 
     shared_state = SharedState()
 
     # --- Command callbacks for the API ---
     async def do_plug():
         from ocpp.v16.enums import ChargePointStatus as CPS
+
         if cp is None:
-            return
+            raise web.HTTPServiceUnavailable(text="OCPP connection is unavailable")
         # Bug 5 fix: don't plug if already plugged in or charging
-        if cp.state in (CPS.preparing, CPS.charging, CPS.suspended_ev, CPS.suspended_evse):
+        if cp.state in (
+            CPS.preparing,
+            CPS.charging,
+            CPS.suspended_ev,
+            CPS.suspended_evse,
+        ):
             return
         cp.state = CPS.preparing
         shared_state.state = cp.state
@@ -65,8 +131,10 @@ async def run() -> None:
 
     async def do_unplug():
         from ocpp.v16.enums import ChargePointStatus as CPS
+
         if cp is None:
-            return
+            raise web.HTTPServiceUnavailable(text="OCPP connection is unavailable")
+        cp.invalidate_pending_start()
         # Set unplugged state immediately so the integration sees it
         shared_state.plugged_in = False
         shared_state.state = CPS.available
@@ -89,7 +157,9 @@ async def run() -> None:
         if cp is not None:
             cp._power_override = power_kw
 
-    api_app = create_api_app(shared_state, do_plug, do_unplug, do_set_current, do_set_power)
+    api_app = create_api_app(
+        shared_state, do_plug, do_unplug, do_set_current, do_set_power
+    )
     runner = web.AppRunner(api_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8099)
@@ -99,72 +169,55 @@ async def run() -> None:
     attempt = 0
     cp = None
     try:
-      while True:
-        try:
-            async with websockets.connect(
-                config.websocket_url,
-                subprotocols=["ocpp1.6"],
-            ) as ws:
-                attempt = 0
-                logger.info("Connected to OCPP server")
-
-                cp = ChargePoint(
-                    id=config.chargepoint_id,
-                    connection=ws,
-                    persistence=persistence,
-                    current_amps=config.current_amps,
-                    shared_state=shared_state,
-                )
-
-                # Start message loop first so incoming messages are handled
-                start_task = asyncio.create_task(cp.start())
-
-                # Use configured serial, or generate/load a persistent one
-                serial = config.charger_serial or persistence.load_serial_number()
-
-                interval = await cp.send_boot_notification(
-                    model=config.charger_model,
-                    vendor=config.charger_vendor,
-                    serial_number=serial,
-                    firmware_version=config.firmware_version,
-                )
-
-                tasks = [
-                    start_task,
-                    cp.heartbeat_loop(interval),
-                    cp.meter_values_loop(),
-                ]
-
-                # Run interactive console when stdin is a terminal
-                if sys.stdin.isatty():
-                    tasks.append(console_loop(cp, do_plug, do_unplug, do_set_current))
-
-                await asyncio.gather(*tasks)
-
-        except (
-            websockets.exceptions.ConnectionClosed,
-            websockets.exceptions.WebSocketException,
-            OSError,
-        ) as e:
-            cp = None  # prevent stale cp access during reconnection
-            shared_state.connected_to_server = False
-            backoff = BACKOFF_STEPS[min(attempt, len(BACKOFF_STEPS) - 1)]
-            logger.warning(
-                "Connection lost (%s), reconnecting in %ds...", e, backoff,
-            )
-            attempt += 1
-            await asyncio.sleep(backoff)
-        except SystemExit:
-            logger.info("Shutting down, sending Unavailable status")
+        while True:
             try:
-                if cp is not None:
-                    await cp.send_status_unavailable()
-            except Exception:
-                pass
-            break
+                async with websockets.connect(
+                    config.websocket_url,
+                    subprotocols=["ocpp1.6"],
+                ) as ws:
+                    attempt = 0
+                    logger.info("Connected to OCPP server")
+
+                    cp = ChargePoint(
+                        id=config.chargepoint_id,
+                        connection=ws,
+                        persistence=persistence,
+                        current_amps=config.current_amps,
+                        shared_state=shared_state,
+                    )
+
+                    console = None
+                    if sys.stdin.isatty():
+                        console = lambda: console_loop(
+                            cp, do_plug, do_unplug, do_set_current
+                        )
+                    await run_emulator_session(cp, config, persistence, console)
+
+            except (
+                websockets.exceptions.ConnectionClosed,
+                websockets.exceptions.WebSocketException,
+                OSError,
+            ) as e:
+                cp = None  # prevent stale cp access during reconnection
+                shared_state.connected_to_server = False
+                backoff = BACKOFF_STEPS[min(attempt, len(BACKOFF_STEPS) - 1)]
+                logger.warning(
+                    "Connection lost (%s), reconnecting in %ds...",
+                    e,
+                    backoff,
+                )
+                attempt += 1
+                await asyncio.sleep(backoff)
+            except SystemExit:
+                logger.info("Shutting down, sending Unavailable status")
+                try:
+                    if cp is not None:
+                        await cp.send_status_unavailable()
+                except Exception:
+                    pass
+                break
     finally:
         await runner.cleanup()
-
 
 
 def _handle_sigterm(*args):

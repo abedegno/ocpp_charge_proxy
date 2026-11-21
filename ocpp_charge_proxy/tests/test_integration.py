@@ -27,6 +27,7 @@ from src.persistence import Persistence
 # Fake WebSocket connection using two asyncio queues
 # ---------------------------------------------------------------------------
 
+
 class _FakeSide:
     def __init__(self, send_q: asyncio.Queue, recv_q: asyncio.Queue):
         self._send_q = send_q
@@ -54,6 +55,7 @@ class FakeConnection:
 # ---------------------------------------------------------------------------
 # Mock OCPP server
 # ---------------------------------------------------------------------------
+
 
 class MockServer(BaseChargePoint):
     """A minimal CSMS that records incoming calls and responds."""
@@ -90,7 +92,9 @@ class MockServer(BaseChargePoint):
         return call_result.MeterValuesPayload()
 
     @on(Action.StartTransaction)
-    async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **kw):
+    async def on_start_transaction(
+        self, connector_id, id_tag, meter_start, timestamp, **kw
+    ):
         self.last_start_tx = {
             "connector_id": connector_id,
             "id_tag": id_tag,
@@ -119,6 +123,7 @@ class MockServer(BaseChargePoint):
 # ---------------------------------------------------------------------------
 # Integration test
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_full_ocpp_flow(tmp_path):
@@ -170,7 +175,7 @@ async def test_full_ocpp_flow(tmp_path):
         # (state transitions: Available -> SuspendedEV -> Charging)
         await asyncio.wait_for(server.start_tx_received.wait(), timeout=5)
         assert server.last_start_tx is not None
-        assert server.last_start_tx["id_tag"] == "NoAuthorization"
+        assert server.last_start_tx["id_tag"] == "TEST_TAG"
         assert server.last_start_tx["meter_start"] == 0  # fresh persistence
 
         # The client sets _transaction_id after processing the response in a
@@ -194,7 +199,9 @@ async def test_full_ocpp_flow(tmp_path):
         await asyncio.wait_for(server.stop_tx_received.wait(), timeout=5)
         assert server.last_stop_tx is not None
         assert server.last_stop_tx["transaction_id"] == 42
-        assert server.last_stop_tx["meter_stop"] == 0  # no time elapsed, no energy added
+        assert (
+            server.last_stop_tx["meter_stop"] == 0
+        )  # no time elapsed, no energy added
 
     finally:
         client_task.cancel()

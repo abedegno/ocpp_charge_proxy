@@ -1,110 +1,106 @@
-# Home Assistant Add-on: OCPP Charge Proxy
+# OCPP Charge Proxy app
 
-## How to use
-
-This add-on acts as a virtual OCPP 1.6 chargepoint and connects to any
-OCPP 1.6J server. When the server sends charge scheduling commands, the add-on
-updates its state so Home Assistant automations can respond.
-
-## Prerequisites
-
-- An OCPP 1.6J compatible provider account (or any CSMS that accepts OCPP 1.6
-  chargepoint connections)
-- OCPP connection credentials (server hostname, chargepoint ID, password)
-  from your provider
+Choose `emulator` for a virtual single-phase chargepoint or `relay` to observe a
+real charger's OCPP 1.6J conversation. The emulator remains the default. Read
+[relay setup](https://github.com/abedegno/ocpp_charge_proxy/blob/master/ocpp_charge_proxy/RELAY.md)
+before changing a physical charger endpoint.
 
 ## Configuration
 
-### Required options
+| Option | Default | Applies to | Meaning |
+|--------|---------|------------|---------|
+| `mode` | `emulator` | Both | `emulator` or `relay` |
+| `server_hostname` | Required | Both | Provider host and optional port, without scheme or path |
+| `chargepoint_id` | Required | Both | Provider-assigned chargepoint identity / Basic username |
+| `password` | Required | Both | Provider-assigned OCPP password |
+| `relay_certfile` | Empty | Relay | Certificate chain under `/ssl`; requires matching key |
+| `relay_keyfile` | Empty | Relay | TLS private key under `/ssl` |
+| `charger_model` | `PLP2-0-2-2` | Emulator | Model reported in BootNotification |
+| `charger_vendor` | `Wall Box Chargers` | Emulator | Reported vendor |
+| `charger_serial` | Auto-generated | Emulator | Persisted virtual serial if not supplied |
+| `firmware_version` | `6.11.16` | Emulator | Reported identity string, not this app's version |
+| `current_amps` | `32` | Emulator | Virtual setting: 6/10/13/16/20/25/32 A |
+| `initial_energy_wh` | `0` | Emulator | One-time register seed in Wh, cleared after reading |
+| `log_level` | `info` | Both | `debug`, `info`, `warning`, `error` |
 
-| Option | Description |
-|--------|-------------|
-| `server_hostname` | Your provider's OCPP server hostname |
-| `chargepoint_id` | Your chargepoint ID for authentication |
-| `password` | Your OCPP password |
+The app connects upstream over verified WSS. The standalone test runner can use
+`--no-tls` for a local mock provider; this does not disable certificate verification
+for WSS. Do not run an emulator and a real charger concurrently with the same
+provider identity.
 
-### Optional options
+## Network ports and ingress
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `charger_model` | `PLP2-0-2-2` | Charger model reported in BootNotification |
-| `charger_vendor` | `Wall Box Chargers` | Charger vendor reported in BootNotification |
-| `charger_serial` | Auto-generated | Charger serial number (generated on first boot if empty) |
-| `firmware_version` | `6.11.16` | Firmware version reported in BootNotification |
-| `current_amps` | `32` | Maximum charging current in amps (6/10/13/16/20/25/32) |
-| `initial_energy_wh` | `0` | Seed the energy register (Wh). Set to your old charger's meter reading when migrating. Cleared after first boot. |
-| `log_level` | `info` | Logging level (debug/info/warning/error) |
+- **8099/TCP:** internal HTTP state/control API and ingress status page. Leave it
+  unmapped on HA OS. It has no independent authentication.
+- **9000/TCP:** authenticated charger-facing relay listener; map a host port only
+  when using relay mode. It is not the ingress URL.
+- With no relay certificate/key, the listener uses plaintext WS on a trusted LAN.
+  With both configured, it uses WSS; the charger must trust the certificate.
 
-### Controlling your charger
+## Emulator behavior
 
-Use the companion integration's **State** sensor to trigger automations when
-your provider starts or stops charging. For example, create an automation that
-turns on a smart plug when the state changes to `Charging` and turns it off
-when it changes to `Preparing` or `Available`.
+The app registers the configured identity, sends heartbeats and meter values, and
+reports a virtual connector. The companion's Plugged In switch sets Preparing.
+RemoteStartTransaction starts a virtual transaction using the requested ID tag;
+RemoteStopTransaction stops it. Hard reset closes the connection for reconnection.
+All work for a connection is cancelled before reconnecting, including command
+follow-ups. An interrupted virtual transaction is not durably resumed.
 
-### Power entity
+Positive profile limits cap simulated/override power and offered power. Zero
+limits suspend an active transaction; clearing or expiring a limit allows it to
+resume. Absolute/Relative profiles honor validity, duration and applicable stack
+levels. ChargePointMaxProfile caps transaction/default profiles. Recurring and
+multiphase profiles are not implemented and are rejected. Profile boundaries are
+checked during meter sampling, so timing precision depends on the meter interval.
 
-You can optionally configure a Home Assistant power sensor in the companion
-integration's settings. The proxy will report this real power value to your
-provider instead of simulating power delivery. The value is capped at what the
-virtual chargepoint could physically deliver at its current setting.
+Estimated energy integrates the last sampled power over charging time, excludes
+pre-transaction idle time and includes the final interval at stop. The import
+register persists atomically under `/data`; invalid files fall back to zero.
+Simulation cannot reproduce a real vehicle's taper, losses or billing meter.
 
-If not configured, the proxy uses a realistic power simulation.
+To control a physical load from emulator state, create separate HA automations.
+This app does not turn the real Wallbox on or off in emulator mode.
 
-## How it works
+## Companion integration
 
-1. The add-on connects to your provider's OCPP server via WebSocket
-2. It registers as a chargepoint (BootNotification)
-3. It sends periodic heartbeats and meter values
-4. When you "plug in" via the companion integration, it reports `Preparing`
-5. Your provider creates a charge schedule and sends `RemoteStartTransaction`
-6. The proxy transitions through `SuspendedEV` -> `Charging` and reports
-   meter values
-7. When the provider ends the session, it sends `RemoteStopTransaction`
-8. The proxy reports `Finishing` then returns to `Preparing`
+Copy `custom_components/ocpp_charge_proxy` from the repository to
+`/config/custom_components/ocpp_charge_proxy`, then restart Core. Accept Supervisor
+discovery or configure the internal API URL under Devices & Services. Keep the
+configuration entry during upgrades to preserve entity IDs. Do not use `localhost`
+to address a separate HA OS app container.
 
-If the connection drops, the add-on automatically reconnects with exponential
-backoff.
+The combined app/integration repository cannot be installed through current
+Marketplace rules. A Marketplace distribution requires a separate integration
+repository; manual installation retains the existing architecture.
 
-## Companion Integration
+The optional power sensor supports recognized HA power units, converted to kW.
+Values are capped by charger/profile limits. Unknown, unavailable, non-finite and
+unsupported-unit values clear the override and restore simulation. No configured
+sensor also means simulation. In relay mode this option is ignored, simulator
+controls are unavailable, and API writes return 405.
 
-Install the companion integration via HACS to get proper HA entities:
+## Relay diagnostics and rollback
 
-1. Add this repository to HACS as a custom repository (Integration category)
-2. Install "OCPP Charge Proxy" from HACS
-3. Restart Home Assistant
-4. The integration should auto-discover the add-on. If not, go to
-   Settings > Devices & Services > Add Integration > OCPP Charge Proxy
+Ingress shows both connection states and redacted recent traffic. Persistent,
+rotating logs are in `/data/relay/traffic.jsonl`. Check `log_dropped` and `log_error`
+before interpreting a capture. Matching OCPP responses show the real charger's
+acknowledgement; forwarding alone does not prove a command was applied.
 
-### Entities provided
+Save the original charger endpoint, identity and authentication before testing.
+Rollback restores those settings and stops the relay. A charger may continue a
+previously accepted offline schedule when the relay/provider is unavailable.
 
-| Entity | Type | Description |
-|--------|------|-------------|
-| Plugged In | Switch | Simulate car plugged in/unplugged |
-| Current Amps Setting | Select | Set charger current (6-32A) |
-| State | Sensor | OCPP state (Available/Preparing/Charging/etc.) |
-| Power | Sensor | Current power draw (kW) |
-| Energy | Sensor | Cumulative energy (kWh, works with energy dashboard) |
-| Current | Sensor | Current draw (A) |
-| Power Source | Sensor | Whether using real entity or simulated values |
-| Connected to Server | Binary Sensor | Connected to OCPP server |
+## Troubleshooting
 
-### Integration options
+- **Provider connection fails:** verify the OCPP hostname, identity, password,
+  clock/TLS trust and that the same identity is not connected elsewhere.
+- **Companion cannot connect:** check app status and use its internal container
+  hostname with port 8099. Ensure Core can resolve/reach it.
+- **Relay charger rejected:** check the full `/<chargepoint_id>` path, Basic
+  credentials and `ocpp1.6` subprotocol; queries and other charger IDs are rejected.
+- **Missing relay measurements:** aggregate Raw MeterValues must be reported by
+  the real charger. The app does not invent missing values.
+- **Missing logs:** check dropped-record/error indicators and available storage.
 
-In the integration's settings (Configure), you can optionally set a **power
-sensor** entity. This should be a sensor that reports power in watts (W), such
-as your battery charge power or grid demand sensor.
-
-## Getting your OCPP credentials
-
-Your provider will supply three values needed to connect:
-
-- **Server hostname** — the OCPP WebSocket endpoint
-- **Chargepoint ID** — your unique chargepoint identifier
-- **Password** — authentication password
-
-You may also need to set `charger_model` and `charger_vendor` to match a
-charger model your provider supports. The defaults work for providers that
-accept Wallbox chargepoints.
-
-Check your provider's app or documentation for how to obtain these credentials.
+Provider accounts do not always expose OCPP credentials or endpoint settings.
+The app cannot derive them from a consumer API integration.
