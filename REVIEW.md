@@ -82,3 +82,9 @@ References checked:
   error/vendor-command paths remain coverage gaps. Review coverage artifacts
   before extending those behaviors; a passing suite does not establish their
   completeness.
+
+- The pinned HA builder still accepts `build.yaml`, but CI flags that file as
+  deprecated. Moving base-image selection and build metadata entirely into the
+  Dockerfile remains a build-toolchain follow-up; both current architecture builds
+  pass. Deprecated Node 20 setup/artifact actions were updated to official Node 24
+  releases.
