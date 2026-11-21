@@ -1,34 +1,52 @@
 name: Tests
 
 on:
-  push:
-    branches:
-      - main
-      - master
-  pull_request:
-    branches:
-      - main
-      - master
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  test:
-    name: Run tests
+  app:
+    name: App Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install dependencies
+        run: python -m pip install -r ocpp_charge_proxy/requirements-dev.txt
+      - name: Test app and measure branch coverage
+        run: >-
+          python -m pytest ocpp_charge_proxy/tests -q
+          --cov=src --cov-branch --cov-report=term-missing
+          --cov-report=xml:coverage-app.xml --cov-fail-under=70
+      - name: Save coverage
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: coverage-app-${{ matrix.python }}
+          path: coverage-app.xml
+
+  companion:
+    name: Companion Home Assistant 2026.11.1
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6.0.2
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v6.0.2
+      - uses: actions/setup-python@v7.1.0
         with:
-          python-version: "3.13"
-
-      - name: Install dependencies
-        working-directory: ocpp_charge_proxy
-        run: |
-          pip install -r requirements.txt
-          pip install pytest pytest-asyncio pytest-aiohttp
-
-      - name: Run tests
-        working-directory: ocpp_charge_proxy
-        run: python -m pytest tests/ -v
+          python-version: "3.14"
+      - run: python -m pip install -r requirements-ha-test.txt
+      - name: Test actual Home Assistant classes
+        run: >-
+          python -m pytest tests -q
+          --cov=custom_components.ocpp_charge_proxy --cov-branch
+          --cov-report=term-missing --cov-report=xml:coverage-companion.xml
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: coverage-companion
+          path: coverage-companion.xml

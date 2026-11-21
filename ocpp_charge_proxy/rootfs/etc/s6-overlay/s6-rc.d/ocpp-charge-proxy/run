@@ -15,6 +15,15 @@ export IO_FIRMWARE_VERSION=$(bashio::config 'firmware_version')
 export IO_CURRENT_AMPS=$(bashio::config 'current_amps')
 export IO_INITIAL_ENERGY_WH=$(bashio::config 'initial_energy_wh')
 export IO_LOG_LEVEL=$(bashio::config 'log_level')
+export IO_MODE=$(bashio::config 'mode')
+export IO_RELAY_CERTFILE=$(bashio::config 'relay_certfile')
+export IO_RELAY_KEYFILE=$(bashio::config 'relay_keyfile')
+
+if [ "${IO_MODE}" = "relay" ]; then
+    bashio::log.info "Starting transparent relay (no emulator)"
+    cd /app || exit 1
+    exec python3 -m src
+fi
 
 # Auto-generate serial number if empty, write back to config
 if [ -z "${IO_CHARGER_SERIAL}" ]; then

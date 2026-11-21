@@ -1,12 +1,14 @@
 # OCPP Charge Proxy
 
-A virtual OCPP 1.6 chargepoint that connects to smart tariff providers,
-allowing you to benefit from charging schedules without a compatible charger.
+A Home Assistant app with a virtual OCPP 1.6J chargepoint and an opt-in transparent
+relay for a real charger. The companion integration exposes state as HA entities;
+the app also has a built-in status page.
 
-Works with any EV and charger — use Home Assistant automations to
-control a smart plug, home battery, or any other device when your
-provider schedules charging.
+- **Emulator** is the default. A separate automation controls any physical load.
+- **Relay** forwards unchanged charger/provider messages and records diagnostics.
 
-See the [full documentation][docs] for setup instructions.
+Provider credentials and a configurable charger endpoint are prerequisites for
+relay deployment. Compatibility with a particular provider must be verified.
 
-[docs]: https://github.com/abedegno/ocpp_charge_proxy
+See [configuration](DOCS.md), [relay setup](RELAY.md) and the
+[repository README](https://github.com/abedegno/ocpp_charge_proxy).

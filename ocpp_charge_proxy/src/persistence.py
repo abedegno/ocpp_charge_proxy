@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import random
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -20,27 +21,41 @@ class Persistence:
         try:
             with open(path) as f:
                 data = json.load(f)
-                return data.get(key, default)
-        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+                return data.get(key, default) if isinstance(data, dict) else default
+        except (OSError, ValueError):
             return default
 
     def _write(self, filename: str, key: str, value):
         path = os.path.join(self._data_dir, filename)
+        temporary = None
         try:
-            with open(path, "w") as f:
-                json.dump({key: value}, f)
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=self._data_dir, delete=False
+            ) as stream:
+                temporary = stream.name
+                json.dump({key: value}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
         except OSError:
             logger.warning("Failed to write %s", path)
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
 
     def load_energy_register_wh(self) -> int:
-        return self._read(_ENERGY_FILE, "energy_wh", 0)
+        value = self._read(_ENERGY_FILE, "energy_wh", 0)
+        return value if type(value) is int and value >= 0 else 0
 
     def save_energy_register_wh(self, value: int) -> None:
         self._write(_ENERGY_FILE, "energy_wh", value)
 
     def load_serial_number(self) -> str:
         serial = self._read(_SERIAL_FILE, "serial", "")
-        if not serial:
+        if not isinstance(serial, str) or not serial:
             serial = str(random.randint(100000, 999999))
             self.save_serial_number(serial)
             logger.info("Generated charger serial number: %s", serial)

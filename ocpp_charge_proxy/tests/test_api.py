@@ -88,3 +88,37 @@ async def test_post_current_invalid(client):
 async def test_post_current_missing_body(client):
     resp = await client.post("/api/current")
     assert resp.status == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [16.9, True, "16", None, {}, float("inf")])
+async def test_current_requires_integer_without_coercion(client, mock_commands, value):
+    response = await client.post("/api/current", json={"amps": value})
+    assert response.status == 400
+    assert not mock_commands["calls"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value", [float("nan"), float("inf"), float("-inf"), True, "2.4", {}, []]
+)
+async def test_power_rejects_nonfinite_or_nonnumeric(aiohttp_client, value):
+    calls = []
+
+    async def set_power(power):
+        calls.append(power)
+
+    client = await aiohttp_client(create_api_app(SharedState(), on_set_power=set_power))
+    response = await client.post("/api/power", json={"power_kw": value})
+    assert response.status == 400
+    assert not calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [{}, [], None])
+async def test_power_requires_explicit_value(aiohttp_client, body):
+    async def set_power(power):
+        raise AssertionError("must not mutate")
+
+    client = await aiohttp_client(create_api_app(SharedState(), on_set_power=set_power))
+    assert (await client.post("/api/power", json=body)).status == 400

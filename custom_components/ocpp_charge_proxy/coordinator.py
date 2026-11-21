@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import math
 from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.const import ATTR_UNIT_OF_MEASUREMENT, UnitOfPower
+from homeassistant.util.unit_conversion import PowerConverter
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import (
@@ -42,15 +45,15 @@ class OCPPChargeProxyCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self) -> dict:
         try:
-            if self._power_entity:
-                await self._push_power_reading()
-
             async with self._session.get(
                 f"{self._api_url}/api/state",
                 timeout=10,
             ) as resp:
                 resp.raise_for_status()
-                return await resp.json()
+                data = await resp.json()
+            if self._power_entity and data.get("mode", "emulator") != "relay":
+                await self._push_power_reading()
+            return data
         except Exception as err:
             raise UpdateFailed(f"Error communicating with add-on: {err}") from err
 
@@ -61,21 +64,31 @@ class OCPPChargeProxyCoordinator(DataUpdateCoordinator):
             if state is None or state.state in ("unavailable", "unknown"):
                 power_kw = None
             else:
-                power_kw = float(state.state) / 1000.0  # W to kW
+                unit = state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
+                if unit not in PowerConverter.VALID_UNITS:
+                    raise ValueError("Unsupported power sensor unit")
+                power_kw = PowerConverter.convert(
+                    float(state.state), unit, UnitOfPower.KILO_WATT
+                )
+                if not math.isfinite(power_kw):
+                    power_kw = None
         except (ValueError, TypeError):
             power_kw = None
 
         try:
-            await self._session.post(
+            async with self._session.post(
                 f"{self._api_url}/api/power",
                 json={"power_kw": power_kw},
                 timeout=3,
-            )
+            ) as response:
+                response.raise_for_status()
         except Exception:
             logger.debug("Failed to push power reading to add-on", exc_info=True)
 
     async def send_command(self, endpoint: str, json: dict | None = None) -> None:
         """Send a command to the add-on API."""
+        if self.data and self.data.get("mode") == "relay":
+            raise HomeAssistantError("Relay mode is read-only")
         url = f"{self._api_url}{endpoint}"
         try:
             async with self._session.post(url, json=json, timeout=5) as resp:

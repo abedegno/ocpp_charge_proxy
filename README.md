@@ -1,113 +1,108 @@
 # OCPP Charge Proxy
 
-[![License][license-shield]](LICENSE.md)
-[![HACS][hacs-shield]][hacs-url]
+An OCPP 1.6J app with two modes, plus a Home Assistant companion integration.
+The app runs separately from Home Assistant Core; the integration exposes its
+state as entities. Both components remain in this repository.
 
-![Supports aarch64 Architecture][aarch64-shield]
-![Supports amd64 Architecture][amd64-shield]
+| Mode | Connection | Purpose |
+|------|------------|---------|
+| `emulator` (default) | Virtual chargepoint → provider | Simulate a single-phase charger and expose its state for automations |
+| `relay` | Real charger ↔ app ↔ provider | Forward unchanged OCPP messages and inspect scheduling commands/responses |
 
-Acts as a virtual OCPP 1.6 chargepoint that connects to smart tariff
-providers on your behalf. Use it to get cheap-rate charging schedules
-without a compatible charger, or to keep control of your charging
-alongside provider-managed scheduling.
+Relay mode records the real charger's behavior. It does not change charge targets,
+replace Octopus scheduling, generate meter readings or acknowledge commands on the
+charger's behalf. See [relay setup and diagnostics](ocpp_charge_proxy/RELAY.md).
 
-## Why?
+Emulator mode presents a virtual charger. An automation must control any real
+charger or other load separately. Its energy readings are simulated estimates,
+including when a power-entity override is used; they are not a billing meter.
 
-When a charger is enrolled with a smart tariff provider via OCPP, the provider
-takes exclusive control of charging sessions. That means solar diversion no
-longer works — your home can be exporting surplus solar while the car sits idle,
-waiting for the provider to schedule a cheap-rate slot.
+## Compatibility
 
-This proxy solves the problem by presenting a virtual charger to your provider.
-The provider sends its charging schedules to the proxy instead of your real
-charger, and the proxy exposes the schedule as Home Assistant entities.
-You then build automations that combine the provider schedule with solar
-diversion, surplus export, or any other logic you choose — keeping the best
-of both worlds.
+- OCPP **1.6J**, HTTP Basic charger authentication, one connector, single phase.
+- Home Assistant OS app packaging: `aarch64` and `amd64`.
+- Companion integration targets Home Assistant **2026.11+**; tests use 2026.11.1.
+- The app uses Python 3.13 independently of Core; CI tests it on 3.13 and 3.14.
+- Local simulated-provider tests cover both modes. Real Octopus/Wallbox relay
+  compatibility still needs a supervised live test.
 
-## About
+Provider credentials and the ability to configure an OCPP endpoint are required.
+An account connected through a provider's consumer API does not necessarily expose
+these credentials or allow changing the charger endpoint. Compatibility with every
+provider, charger or EV is not implied.
 
-This Home Assistant add-on connects to any OCPP 1.6J compatible server as a
-virtual chargepoint. When the server sends charge scheduling commands, the
-proxy updates its state in Home Assistant so you can trigger automations to
-control any charger, smart plug, or home battery.
+## Install the app
 
-Should work with any OCPP 1.6J provider that accepts chargepoint connections.
+1. Add `https://github.com/abedegno/ocpp_charge_proxy` under
+   **Settings → Apps → App Store → ⋮ → Repositories**.
+2. Install **OCPP Charge Proxy**. Read the app's Documentation tab.
+3. Configure `server_hostname`, `chargepoint_id` and `password`, then choose a mode.
+4. For relay mode, follow [the relay guide](ocpp_charge_proxy/RELAY.md) before
+   changing the charger endpoint. Preserve the original settings for rollback.
+5. Start the app and open its ingress page to check status.
 
-It consists of two components:
+App updates require a published container image matching `config.yaml`'s version.
+A development branch is not an installed release. See [contributing](CONTRIBUTING.md)
+for local builds and release checks.
 
-- **Add-on** — runs the OCPP client (Docker container managed by HA Supervisor)
-- **Integration** (HACS) — exposes entities for automations, dashboards, and the energy dashboard
+## Install the companion integration
 
-Both are installed from this repository.
+The app's ingress page works without the integration. For HA entities:
 
-## Step 1: Install the Add-on
+1. Copy `custom_components/ocpp_charge_proxy` into
+   `/config/custom_components/ocpp_charge_proxy` and restart Home Assistant.
+2. Accept Supervisor discovery, or add **OCPP Charge Proxy** under
+   **Settings → Devices & Services** and enter the internal app API URL.
+3. Keep the configuration entry when replacing the integration files so existing
+   entity IDs remain stable. Restart Core after each manual update.
 
-1. Add this repository to your Home Assistant add-on store:
+The internal API listens on port 8099. Supervisor discovery supplies the container
+hostname. `localhost` in Home Assistant Core does not refer to a separate app
+container. Standalone installations need an API URL reachable from Core.
 
-   [![Add repository][repository-badge]][repository-url]
+The current [Marketplace repository rules](https://contributors.home-assistant.io/marketplace/reference/repository-structure/)
+exclude repositories containing Home Assistant apps. This combined repository
+therefore uses manual companion installation; a Marketplace distribution would
+need an integration-only repository. This packaging restriction does not require
+removing either runtime component.
 
-   Or manually: **Settings > Add-ons > Add-on Store > ... > Repositories** and
-   add this repository URL.
+## Entities and controls
 
-2. Install the **OCPP Charge Proxy** add-on
-3. Configure your OCPP credentials (server hostname, chargepoint ID, password)
-4. Start the add-on
+| Entity | Emulator | Relay |
+|--------|----------|-------|
+| State | Virtual connector state | Last observed connector-1 state |
+| Power / Current | Simulated or capped power override | Observed aggregate meter values; unknown until reported |
+| Energy | Persisted estimated import register | Observed import register; not session energy |
+| Power Source | `simulated` or `entity` | `wallbox` |
+| Connected to Server | Provider connection | Provider connection |
+| Plugged In switch | Simulate plug/unplug | Unavailable |
+| Current Amps selector | Virtual current setting | Unavailable |
 
-## Step 2: Install the Integration (HACS)
+The optional power sensor applies only to emulator mode. Supported HA power units
+are converted to kW. Unknown, unavailable, non-finite or unsupported-unit readings
+clear the override and resume simulation. Relay mode never pushes power overrides.
 
-The integration creates HA entities and auto-discovers the add-on.
+## Scope and limitations
 
-1. Add this repository to HACS as a **custom repository** (category: Integration):
+The emulator evaluates single-phase Absolute and Relative profiles, stack levels,
+profile validity and duration, and combines transaction limits with chargepoint
+maximum limits. Unsupported recurring/multiphase profiles are rejected. Profile
+state changes are evaluated on meter cycles, not by an exact real-time scheduler.
+Energy uses the last sampled power between transitions. The emulator is a test and
+automation tool, not a certified, complete OCPP implementation. Local authorization
+list storage is not an access-control system.
 
-   [![Add to HACS][hacs-badge]][hacs-add-url]
+The relay requires the original charger identity and credentials. It changes the
+network path, so connection interruptions remain possible. Previously accepted
+charger schedules may continue offline. Preserve the direct endpoint for rollback.
+The internal API has no separate authentication: leave port 8099 unmapped on HA OS
+and do not expose it publicly. Use TLS for the charger-facing listener where possible.
 
-   Or manually: **HACS > Integrations > ... > Custom repositories** and add
-   this repository URL.
+## Development and documentation
 
-2. Install **OCPP Charge Proxy** from HACS
-3. Restart Home Assistant
-4. The integration should auto-discover the add-on. If not, go to
-   **Settings > Devices & Services > Add Integration** and search for
-   "OCPP Charge Proxy"
-5. Optionally select a **power sensor** entity (e.g. your battery charge power
-   or grid demand sensor) — the proxy will report real power values to your
-   provider instead of simulated ones
-
-### Entities provided
-
-| Entity | Type | Description |
-|--------|------|-------------|
-| Plugged In | Switch | Simulate car plugged in/unplugged |
-| Current Amps Setting | Select | Set charger current (6-32A) |
-| State | Sensor | OCPP state (Available/Preparing/Charging/etc.) |
-| Power | Sensor | Current power draw (kW) |
-| Energy | Sensor | Cumulative energy (kWh, energy dashboard compatible) |
-| Current | Sensor | Current draw (A) |
-| Power Source | Sensor | Whether using real entity or simulated values |
-| Connected to Server | Binary Sensor | Connected to OCPP server |
-
-## Usage
-
-1. Start the add-on and verify it connects (check the add-on logs)
-2. Toggle the **Plugged In** switch to simulate connecting a car
-3. Set a departure time and charge amount in your provider's app
-4. Your provider will schedule charging and send start/stop commands
-5. Create automations based on the **State** sensor to control your actual
-   charger (e.g. turn on a smart plug when State changes to `Charging`)
-
-## Documentation
-
-See the [add-on documentation][docs] for full configuration details including
-power entity setup, charger migration, and getting your OCPP credentials.
-
-[aarch64-shield]: https://img.shields.io/badge/aarch64-yes-green.svg
-[amd64-shield]: https://img.shields.io/badge/amd64-yes-green.svg
-[license-shield]: https://img.shields.io/badge/license-MIT-blue.svg
-[hacs-shield]: https://img.shields.io/badge/HACS-Custom-41BDF5.svg
-[hacs-url]: https://github.com/hacs/integration
-[hacs-badge]: https://my.home-assistant.io/badges/hacs_repository.svg
-[hacs-add-url]: https://my.home-assistant.io/redirect/hacs_repository/?owner=abedegno&repository=ocpp_charge_proxy&category=integration
-[docs]: ocpp_charge_proxy/DOCS.md
-[repository-badge]: https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg
-[repository-url]: https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fabedegno%2Focpp_charge_proxy
+- [App configuration and emulator behavior](ocpp_charge_proxy/DOCS.md)
+- [Relay setup, logs and rollback](ocpp_charge_proxy/RELAY.md)
+- [Tests, coverage and release process](CONTRIBUTING.md)
+- [Review findings and remaining limits](REVIEW.md)
+- [Changelog](ocpp_charge_proxy/CHANGELOG.md)
+- [MIT license](LICENSE.md)

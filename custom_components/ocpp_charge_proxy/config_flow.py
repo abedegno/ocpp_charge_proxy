@@ -42,7 +42,8 @@ class OCPPChargeProxyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     _discovered_url: str | None = None
 
     async def async_step_hassio(
-        self, discovery_info: HassioServiceInfo,
+        self,
+        discovery_info: HassioServiceInfo,
     ) -> config_entries.ConfigFlowResult:
         """Handle Supervisor discovery."""
         config = discovery_info.config
@@ -62,7 +63,8 @@ class OCPPChargeProxyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_abort(reason="cannot_connect")
 
     async def async_step_hassio_confirm(
-        self, user_input: dict[str, Any] | None = None,
+        self,
+        user_input: dict[str, Any] | None = None,
     ) -> config_entries.ConfigFlowResult:
         """Confirm Supervisor discovery."""
         if user_input is not None:
@@ -85,7 +87,8 @@ class OCPPChargeProxyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_user(
-        self, user_input: dict[str, Any] | None = None,
+        self,
+        user_input: dict[str, Any] | None = None,
     ) -> config_entries.ConfigFlowResult:
         """Handle manual configuration."""
         errors = {}
@@ -135,28 +138,21 @@ class OCPPChargeProxyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         config_entry: config_entries.ConfigEntry,
     ) -> OCPPChargeProxyOptionsFlow:
         """Get the options flow handler."""
-        return OCPPChargeProxyOptionsFlow(config_entry)
+        return OCPPChargeProxyOptionsFlow()
 
 
-# Use OptionsFlowWithConfigEntry if available (HA 2025.x+), fall back to OptionsFlow
-_OptionsBase = getattr(config_entries, "OptionsFlowWithConfigEntry", config_entries.OptionsFlow)
-
-
-class OCPPChargeProxyOptionsFlow(_OptionsBase):
-    """Handle options for OCPP Charge Proxy."""
-
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self._config_entry = config_entry
-        super().__init__(config_entry)
+class OCPPChargeProxyOptionsFlow(config_entries.OptionsFlow):
+    """Handle options using the config entry supplied by Home Assistant."""
 
     async def async_step_init(
-        self, user_input: dict[str, Any] | None = None,
+        self,
+        user_input: dict[str, Any] | None = None,
     ) -> config_entries.ConfigFlowResult:
         """Manage options."""
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        current = self._config_entry.options.get("power_entity", "")
+        current = self.config_entry.options.get("power_entity", "")
 
         return self.async_show_form(
             step_id="init",

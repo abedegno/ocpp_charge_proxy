@@ -55,3 +55,26 @@ def test_config_redacted_url():
     )
     assert "secret" not in cfg.redacted_url
     assert "CP001" in cfg.redacted_url
+
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("IO_SERVER_HOSTNAME", "https://example.com/path"),
+        ("IO_SERVER_HOSTNAME", "user:secret@example.com"),
+        ("IO_SERVER_HOSTNAME", ""),
+        ("IO_PASSWORD", ""),
+        ("IO_CURRENT_AMPS", "15"),
+        ("IO_INITIAL_ENERGY_WH", "-1"),
+    ],
+)
+def test_invalid_config_fails_before_connecting(monkeypatch, name, value):
+    monkeypatch.setenv("IO_SERVER_HOSTNAME", "localhost")
+    monkeypatch.setenv("IO_CHARGEPOINT_ID", "CP001")
+    monkeypatch.setenv("IO_PASSWORD", "secret")
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError):
+        load_config()

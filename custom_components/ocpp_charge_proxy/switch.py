@@ -22,16 +22,24 @@ async def async_setup_entry(
     async_add_entities([OCPPChargeProxyPlugSwitch(coordinator, entry)])
 
 
-class OCPPChargeProxyPlugSwitch(CoordinatorEntity[OCPPChargeProxyCoordinator], SwitchEntity):
+class OCPPChargeProxyPlugSwitch(
+    CoordinatorEntity[OCPPChargeProxyCoordinator], SwitchEntity
+):
     """Switch to simulate car plugged in / unplugged."""
 
     _attr_has_entity_name = True
     _attr_name = "Plugged In"
 
-    def __init__(self, coordinator: OCPPChargeProxyCoordinator, entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: OCPPChargeProxyCoordinator, entry: ConfigEntry
+    ) -> None:
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_plugged_in"
         self._attr_device_info = get_device_info(entry.entry_id)
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.data.get("mode") != "relay"
 
     @property
     def is_on(self) -> bool | None:

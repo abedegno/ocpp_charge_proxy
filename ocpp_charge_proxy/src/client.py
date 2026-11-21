@@ -52,7 +52,11 @@ class ChargePoint(BaseChargePoint):
     ):
         super().__init__(id, connection)
         self.connector_id = 1
-        self.state = ChargePointStatus.available
+        self.state = (
+            ChargePointStatus.preparing
+            if shared_state and shared_state.plugged_in
+            else ChargePointStatus.available
+        )
         self._persistence = persistence
         self._power_override: Optional[float] = None  # kW, set via API
         self._shared_state = shared_state or SharedState()
@@ -60,6 +64,17 @@ class ChargePoint(BaseChargePoint):
         self._transaction_id: Optional[int] = None
         self._transaction_start_energy_wh: int = 0
         self._last_meter_time: float = time.monotonic()
+        self._last_power_kw = 0.0
+        self._energy_remainder_wh = 0.0
+        self._background_tasks: set[asyncio.Task] = set()
+        self._starting_transaction = False
+        self._stopping_transaction = False
+        self._pending_inoperative = False
+        self._command_generation = 0
+        self._shared_state.state = self.state
+        self._shared_state.transaction_id = None
+        self._shared_state.energy_kwh = self.energy_register_kwh
+        self._shared_state.current_amps_setting = current_amps
         self._meter_value_interval: int = 60  # default, updated by ChangeConfiguration
         self._server_config: dict[str, str] = {}  # stores config sent by server
         self._local_list_version: int = 0
@@ -74,7 +89,8 @@ class ChargePoint(BaseChargePoint):
             "ChargingScheduleMaxPeriods": ("24", True),
             "MaxChargingProfilesInstalled": ("5", True),
             "SupportedFeatureProfiles": (
-                "Core,SmartCharging,LocalAuthListManagement,RemoteTrigger", True
+                "Core,SmartCharging,LocalAuthListManagement,RemoteTrigger",
+                True,
             ),
             "AuthorizeRemoteTxRequests": ("true", False),
             "LocalAuthListEnabled": ("true", False),
@@ -86,7 +102,8 @@ class ChargePoint(BaseChargePoint):
             "WebSocketPingInterval": ("30", True),
             "MeterValuesAlignedData": ("", False),
             "MeterValuesSampledData": (
-                "Energy.Active.Import.Register,Power.Active.Import", False
+                "Energy.Active.Import.Register,Power.Active.Import",
+                False,
             ),
             "ConnectorPhaseRotation": ("1.RST", True),
             "GetConfigurationMaxKeys": ("50", True),
@@ -102,6 +119,7 @@ class ChargePoint(BaseChargePoint):
 
     def _zero_power_state(self) -> None:
         """Zero out power-related shared state values."""
+        self._last_power_kw = 0.0
         self._shared_state.power_kw = 0.0
         self._shared_state.current_a = 0.0
         self._shared_state.power_offered_kw = 0.0
@@ -109,8 +127,11 @@ class ChargePoint(BaseChargePoint):
         self._shared_state.power_entity_value = None
 
     async def send_boot_notification(
-        self, model: str, vendor: str,
-        serial_number: str = "", firmware_version: str = "",
+        self,
+        model: str,
+        vendor: str,
+        serial_number: str = "",
+        firmware_version: str = "",
     ) -> int:
         request = call.BootNotificationPayload(
             charge_point_model=model,
@@ -132,9 +153,15 @@ class ChargePoint(BaseChargePoint):
                 await self._send_status_for_connector(0)
                 await self.send_status()
                 interval = response.interval
-                return interval if interval and interval > 0 else 30
+                interval = interval if interval and interval > 0 else 30
+                self._config_store["HeartbeatInterval"] = (str(interval), False)
+                return interval
             elif response.status == RegistrationStatus.pending:
-                wait = response.interval if response.interval and response.interval > 0 else 30
+                wait = (
+                    response.interval
+                    if response.interval and response.interval > 0
+                    else 30
+                )
                 logger.info("BootNotification pending, retrying in %ds", wait)
                 await asyncio.sleep(wait)
             else:
@@ -143,7 +170,7 @@ class ChargePoint(BaseChargePoint):
 
     async def heartbeat_loop(self, interval: int) -> None:
         while True:
-            await asyncio.sleep(interval)
+            await asyncio.sleep(int(self._config_store["HeartbeatInterval"][0]))
             try:
                 await self.call(call.HeartbeatPayload())
             except Exception:
@@ -157,7 +184,9 @@ class ChargePoint(BaseChargePoint):
             except Exception:
                 logger.warning("Meter values cycle failed", exc_info=True)
 
-    async def _send_status_for_connector(self, connector_id: int, status: ChargePointStatus | None = None) -> None:
+    async def _send_status_for_connector(
+        self, connector_id: int, status: ChargePointStatus | None = None
+    ) -> None:
         """Send StatusNotification for a connector."""
         request = call.StatusNotificationPayload(
             connector_id=connector_id,
@@ -175,59 +204,93 @@ class ChargePoint(BaseChargePoint):
 
     async def send_status_unavailable(self) -> None:
         await self._send_status_for_connector(
-            self.connector_id, ChargePointStatus.unavailable,
+            self.connector_id,
+            ChargePointStatus.unavailable,
+        )
+
+    def _spawn(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+
+        def finished(done):
+            self._background_tasks.discard(done)
+            if not done.cancelled() and done.exception() is not None:
+                logger.error("OCPP follow-up task failed")
+
+        task.add_done_callback(finished)
+        return task
+
+    def invalidate_pending_start(self):
+        self._command_generation += 1
+
+    async def shutdown(self):
+        for task in list(self._background_tasks):
+            task.cancel()
+        await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._account_energy()
+        self._charger_sim.stop_charging()
+        self._shared_state.connected_to_server = False
+        self._shared_state.state = ChargePointStatus.unavailable
+        self._shared_state.transaction_id = None
+        self._transaction_id = None
+        self._zero_power_state()
+
+    def _account_energy(self):
+        now = time.monotonic()
+        added = max(0, now - self._last_meter_time) * self._last_power_kw / 3.6
+        self._last_meter_time = now
+        accumulated = added + self._energy_remainder_wh
+        whole = int(accumulated)
+        self._energy_remainder_wh = accumulated - whole
+        if whole:
+            self._energy_register_wh += whole
+            self._persistence.save_energy_register_wh(self._energy_register_wh)
+        self._shared_state.energy_kwh = self.energy_register_kwh
+
+    def _effective_reading(self, limit_kw):
+        reading = self._charger_sim.sample()
+        offered = (
+            reading.power_offered_kw
+            if limit_kw is None
+            else min(reading.power_offered_kw, max(0, limit_kw))
+        )
+        power = min(reading.power_kw, offered)
+        if self._power_override is not None:
+            power = max(0, min(power, self._power_override))
+        return ChargerReading(
+            power,
+            reading.voltage,
+            round(power * 1000 / reading.voltage, 2),
+            reading.frequency_hz,
+            offered,
+            min(reading.current_offered_a, offered * 1000 / reading.voltage),
         )
 
     async def send_meter_values(self) -> None:
-        now = time.monotonic()
-        elapsed_hours = (now - self._last_meter_time) / 3600.0
-        self._last_meter_time = now
-
-        # Check charging profile to see if we should be charging or paused
-        if self._transaction_id is not None and self._profile_scheduler.has_profile:
-            limit_kw = self._profile_scheduler.get_current_limit_kw()
-            if limit_kw is not None:
-                if limit_kw <= 0 and self._charger_sim.is_charging:
-                    logger.info("Profile says pause — suspending charge")
-                    self._charger_sim.stop_charging()
-                    self.state = ChargePointStatus.suspended_evse
-                    self._shared_state.state = self.state
-                    self._zero_power_state()
-                    await self.send_status()
-                elif limit_kw > 0 and not self._charger_sim.is_charging:
-                    logger.info("Profile says charge at %.1f kW — resuming", limit_kw)
-                    self._charger_sim.start_charging()
-                    self.state = ChargePointStatus.charging
-                    self._shared_state.state = self.state
-                    await self.send_status()
+        # Integrate the previous observed power only over its actual charging interval.
+        self._account_energy()
+        limit_kw = self._profile_scheduler.get_current_limit_kw()
+        if self._transaction_id is not None:
+            allowed = limit_kw is None or limit_kw > 0
+            if allowed and self.state == ChargePointStatus.suspended_evse:
+                self._charger_sim.start_charging()
+                self.state = ChargePointStatus.charging
+                self._shared_state.state = self.state
+                await self.send_status()
+            elif not allowed and self._charger_sim.is_charging:
+                self._charger_sim.stop_charging()
+                self.state = ChargePointStatus.suspended_evse
+                self._shared_state.state = self.state
+                self._zero_power_state()
+                await self.send_status()
 
         if self.state == ChargePointStatus.charging:
-            sim_reading = self._charger_sim.sample()
-
-            # Use power override from integration if available
-            real_power = self._power_override
-            if real_power is not None:
-                # Clamp negatives to 0 (e.g. solar export), cap at charger max
-                capped_power = max(0.0, min(real_power, sim_reading.power_kw))
-                current_a = round((capped_power * 1000) / sim_reading.voltage, 2) if capped_power > 0 else 0.0
-                reading = ChargerReading(
-                    power_kw=capped_power,
-                    voltage=sim_reading.voltage,
-                    current_a=current_a,
-                    frequency_hz=sim_reading.frequency_hz,
-                    power_offered_kw=sim_reading.power_offered_kw,
-                    current_offered_a=sim_reading.current_offered_a,
-                )
-                self._shared_state.power_source = "entity"
-                self._shared_state.power_entity_value = real_power
-            else:
-                reading = sim_reading
-                self._shared_state.power_source = "simulated"
-                self._shared_state.power_entity_value = None
-
-            energy_added_kwh = reading.power_kw * elapsed_hours
-            self._energy_register_wh += round(energy_added_kwh * 1000)
-            self._persistence.save_energy_register_wh(self._energy_register_wh)
+            reading = self._effective_reading(limit_kw)
+            self._last_power_kw = reading.power_kw
+            self._shared_state.power_source = (
+                "entity" if self._power_override is not None else "simulated"
+            )
+            self._shared_state.power_entity_value = self._power_override
 
             meter_value = build_charging_meter_values(
                 reading=reading,
@@ -260,9 +323,15 @@ class ChargePoint(BaseChargePoint):
 
         await self.call(request)
 
-    async def _do_start_transaction(self) -> None:
-        """Start a charging transaction."""
+    async def _do_start_transaction(
+        self, id_tag="NoAuthorization", generation=None
+    ) -> None:
+        """Start a charging transaction; settle a late accepted start after cancellation."""
+        if generation is None:
+            generation = self._command_generation
         try:
+            if generation != self._command_generation:
+                return
             # Send OCPP protocol states but don't update shared_state with
             # intermediate values (Bug 1 fix) — the API should only see the
             # final stable state (Charging).
@@ -273,20 +342,37 @@ class ChargePoint(BaseChargePoint):
             self.state = ChargePointStatus.suspended_ev
             await self.send_status()
 
-            self._charger_sim.start_charging()
             self._transaction_start_energy_wh = self._energy_register_wh
             request = call.StartTransactionPayload(
                 connector_id=self.connector_id,
-                id_tag="NoAuthorization",
+                id_tag=id_tag,
                 meter_start=self._energy_register_wh,
                 timestamp=_now_iso(),
             )
             response: call_result.StartTransactionPayload = await self.call(request)
+            if response.id_tag_info.get("status") != "Accepted":
+                raise ValueError("Transaction authorization rejected")
             self._transaction_id = response.transaction_id
+            if generation != self._command_generation:
+                final = (
+                    ChargePointStatus.preparing
+                    if self._shared_state.plugged_in
+                    else ChargePointStatus.available
+                )
+                await self._do_stop_transaction(final_state=final)
+                return
+            self._charger_sim.start_charging()
+            self._last_meter_time = time.monotonic()
+            self._profile_scheduler.start_transaction()
+            limit_kw = self._profile_scheduler.get_current_limit_kw()
+            self._last_power_kw = self._effective_reading(limit_kw).power_kw
             logger.info("Transaction started: %s", self._transaction_id)
 
             # Transition to Charging — now update shared_state atomically
             self.state = ChargePointStatus.charging
+            if limit_kw is not None and limit_kw <= 0:
+                self._charger_sim.stop_charging()
+                self.state = ChargePointStatus.suspended_evse
             self._shared_state.state = self.state
             self._shared_state.transaction_id = self._transaction_id
             await self.send_status()
@@ -295,20 +381,31 @@ class ChargePoint(BaseChargePoint):
             logger.error("Failed to start transaction", exc_info=True)
             self._charger_sim.stop_charging()
             self._transaction_id = None
-            self.state = ChargePointStatus.preparing
+            if generation == self._command_generation:
+                self.state = ChargePointStatus.preparing
+            else:
+                self.state = self._shared_state.state
             self._shared_state.state = self.state
             self._shared_state.transaction_id = None
             self._zero_power_state()
 
+        finally:
+            self._starting_transaction = False
+
     async def _do_stop_transaction(
-        self, final_state: ChargePointStatus = ChargePointStatus.preparing,
+        self,
+        final_state: ChargePointStatus = ChargePointStatus.preparing,
     ) -> None:
         """Stop the active transaction. final_state controls where we end up."""
         try:
             transaction_id = self._transaction_id
-            energy_delivered_kwh = (self._energy_register_wh - self._transaction_start_energy_wh) / 1000.0
+            if transaction_id is None:
+                return
+            self._account_energy()
+            self._last_power_kw = 0.0
             self._charger_sim.stop_charging()
-            self._profile_scheduler.clear_profile()
+            self._zero_power_state()
+            self._profile_scheduler.clear_profile(purpose="TxProfile")
 
             # Send Finishing status before StopTransaction
             self.state = ChargePointStatus.finishing
@@ -323,38 +420,69 @@ class ChargePoint(BaseChargePoint):
                 transaction_data=[],
             )
             response: call_result.StopTransactionPayload = await self.call(request)
-            logger.info("Transaction %s stopped, response: %s", transaction_id, response)
+            logger.info(
+                "Transaction %s stopped, response: %s", transaction_id, response
+            )
         except Exception:
             logger.error("Failed to stop transaction", exc_info=True)
         finally:
             self._transaction_id = None
             self._shared_state.transaction_id = None
             self._zero_power_state()
-            # Bug 3 fix: use caller-specified final state
+            self._stopping_transaction = False
+            if self._pending_inoperative:
+                final_state = ChargePointStatus.unavailable
+                self._pending_inoperative = False
             self.state = final_state
             self._shared_state.state = self.state
+            if not asyncio.current_task().cancelling():
+                try:
+                    await self.send_status()
+                except Exception:
+                    logger.warning("Failed to send final transaction status")
 
     @on(Action.RemoteStartTransaction)
-    async def on_remote_start_transaction(self, id_tag: str, charging_profile: dict = None, **kwargs):
+    async def on_remote_start_transaction(
+        self, id_tag: str, charging_profile: dict = None, **kwargs
+    ):
         # Bug 6 fix: only accept when car is plugged in (Preparing)
-        if self.state not in (ChargePointStatus.preparing, ChargePointStatus.suspended_ev, ChargePointStatus.suspended_evse):
-            logger.warning("RemoteStart rejected: state is %s (not plugged in)", self.state)
+        if (
+            self._starting_transaction
+            or self._stopping_transaction
+            or self._transaction_id is not None
+            or kwargs.get("connector_id", 1) != 1
+            or self.state
+            not in (
+                ChargePointStatus.preparing,
+                ChargePointStatus.suspended_ev,
+                ChargePointStatus.suspended_evse,
+            )
+        ):
+            logger.warning(
+                "RemoteStart rejected: state is %s (not plugged in)", self.state
+            )
             return call_result.RemoteStartTransactionPayload(
                 status=RemoteStartStopStatus.rejected
             )
 
         if charging_profile:
-            self._profile_scheduler.set_profile(charging_profile)
+            try:
+                self._profile_scheduler.set_profile(charging_profile)
+            except (ValueError, TypeError, KeyError):
+                return call_result.RemoteStartTransactionPayload(
+                    status=RemoteStartStopStatus.rejected
+                )
 
         self._shared_state.plugged_in = True
-        asyncio.create_task(self._do_start_transaction())
+        self._starting_transaction = True
+        self._spawn(self._do_start_transaction(id_tag, self._command_generation))
         return call_result.RemoteStartTransactionPayload(
             status=RemoteStartStopStatus.accepted
         )
 
     @on(Action.RemoteStopTransaction)
     async def on_remote_stop_transaction(self, transaction_id: int, **kwargs):
-        if self._transaction_id is None:
+        if self._transaction_id is None or self._stopping_transaction:
             logger.warning("RemoteStop rejected: no active transaction")
             return call_result.RemoteStopTransactionPayload(
                 status=RemoteStartStopStatus.rejected
@@ -362,12 +490,14 @@ class ChargePoint(BaseChargePoint):
         if transaction_id != self._transaction_id:
             logger.warning(
                 "RemoteStop rejected: transaction_id %s != current %s",
-                transaction_id, self._transaction_id,
+                transaction_id,
+                self._transaction_id,
             )
             return call_result.RemoteStopTransactionPayload(
                 status=RemoteStartStopStatus.rejected
             )
-        asyncio.create_task(self._do_stop_transaction())
+        self._stopping_transaction = True
+        self._spawn(self._do_stop_transaction())
         return call_result.RemoteStopTransactionPayload(
             status=RemoteStartStopStatus.accepted
         )
@@ -383,11 +513,13 @@ class ChargePoint(BaseChargePoint):
         for k in keys_to_return:
             if k in self._config_store:
                 value, readonly = self._config_store[k]
-                configuration_key.append({
-                    "key": k,
-                    "readonly": readonly,
-                    "value": value,
-                })
+                configuration_key.append(
+                    {
+                        "key": k,
+                        "readonly": readonly,
+                        "value": value,
+                    }
+                )
             else:
                 unknown_key.append(k)
 
@@ -399,38 +531,34 @@ class ChargePoint(BaseChargePoint):
     @on(Action.ChangeConfiguration)
     async def on_change_configuration(self, key: str, value: str, **kwargs):
         """Handle configuration changes from the server."""
-        logger.info("Server set config: %s = %s", key, value)
-
-        if key in self._config_store:
-            _, readonly = self._config_store[key]
-            if readonly:
-                logger.info("ChangeConfiguration: key %s is read-only", key)
-                return call_result.ChangeConfigurationPayload(
-                    status=ConfigurationStatus.rejected
-                )
-            self._config_store[key] = (value, False)
-
-        self._server_config[key] = value
-        self._shared_state.server_config = dict(self._server_config)
-
-        if key == "MeterValueSampleInterval":
-            try:
+        if key not in self._config_store and key != "chargingALimitConn1":
+            return call_result.ChangeConfigurationPayload(
+                status=ConfigurationStatus.not_supported
+            )
+        if key in self._config_store and self._config_store[key][1]:
+            return call_result.ChangeConfigurationPayload(
+                status=ConfigurationStatus.rejected
+            )
+        try:
+            if key in ("MeterValueSampleInterval", "HeartbeatInterval"):
                 interval = int(value)
                 if interval < 1:
                     raise ValueError("interval must be >= 1")
-                self._meter_value_interval = interval
-                self._shared_state.meter_interval = self._meter_value_interval
-                logger.info("Meter value interval updated to %ds", self._meter_value_interval)
-            except ValueError:
-                logger.warning("Invalid MeterValueSampleInterval: %s, ignoring", value)
-        elif key == "chargingALimitConn1":
-            amps = int(value)
-            try:
+            if key == "chargingALimitConn1":
+                amps = int(value)
                 self._charger_sim.current_amps = amps
                 self._shared_state.current_amps_setting = amps
-            except ValueError:
-                logger.warning("Server set unsupported current %dA, ignoring", amps)
-
+        except (ValueError, TypeError):
+            return call_result.ChangeConfigurationPayload(
+                status=ConfigurationStatus.rejected
+            )
+        if key in self._config_store:
+            self._config_store[key] = (value, False)
+        self._server_config[key] = value
+        self._shared_state.server_config = dict(self._server_config)
+        if key == "MeterValueSampleInterval":
+            self._meter_value_interval = interval
+            self._shared_state.meter_interval = interval
         return call_result.ChangeConfigurationPayload(
             status=ConfigurationStatus.accepted
         )
@@ -453,7 +581,8 @@ class ChargePoint(BaseChargePoint):
         """Handle local authorization list updates."""
         logger.info(
             "SendLocalList: version=%d type=%s entries=%d",
-            list_version, update_type,
+            list_version,
+            update_type,
             len(local_authorization_list) if local_authorization_list else 0,
         )
 
@@ -470,43 +599,56 @@ class ChargePoint(BaseChargePoint):
         return call_result.SendLocalListPayload(status=UpdateStatus.accepted)
 
     @on(Action.SetChargingProfile)
-    async def on_set_charging_profile(self, connector_id: int, cs_charging_profiles: dict, **kwargs):
+    async def on_set_charging_profile(
+        self, connector_id: int, cs_charging_profiles: dict, **kwargs
+    ):
         logger.info("SetChargingProfile received for connector %s", connector_id)
-        self._profile_scheduler.set_profile(cs_charging_profiles)
-        return call_result.SetChargingProfilePayload(
-            status="Accepted"
-        )
+        try:
+            transaction = cs_charging_profiles.get(
+                "transaction_id", cs_charging_profiles.get("transactionId")
+            )
+            if transaction is not None and transaction != self._transaction_id:
+                raise ValueError("Profile transaction mismatch")
+            self._profile_scheduler.set_profile(cs_charging_profiles, connector_id)
+        except (ValueError, TypeError, KeyError):
+            return call_result.SetChargingProfilePayload(status="Rejected")
+        return call_result.SetChargingProfilePayload(status="Accepted")
 
     @on(Action.ClearChargingProfile)
     async def on_clear_charging_profile(self, **kwargs):
         logger.info("ClearChargingProfile received: %s", kwargs)
-        self._profile_scheduler.clear_profile(
+        matched = self._profile_scheduler.clear_profile(
             profile_id=kwargs.get("id"),
             connector_id=kwargs.get("connector_id"),
             purpose=kwargs.get("charging_profile_purpose"),
             stack_level=kwargs.get("stack_level"),
         )
         return call_result.ClearChargingProfilePayload(
-            status="Accepted"
+            status="Accepted" if matched else "Unknown"
         )
 
     @on(Action.TriggerMessage)
-    async def on_trigger_message(self, requested_message: str, connector_id: int = 0, **kwargs):
+    async def on_trigger_message(
+        self, requested_message: str, connector_id: int = 0, **kwargs
+    ):
         """Handle TriggerMessage: server requests the CP to send a specific message."""
         supported = {
-            "BootNotification", "Heartbeat", "MeterValues", "StatusNotification",
+            "BootNotification",
+            "Heartbeat",
+            "MeterValues",
+            "StatusNotification",
         }
         if requested_message not in supported:
-            logger.warning("TriggerMessage for unsupported message: %s", requested_message)
+            logger.warning(
+                "TriggerMessage for unsupported message: %s", requested_message
+            )
             return call_result.TriggerMessagePayload(
                 status=TriggerMessageStatus.not_implemented
             )
 
         logger.info("TriggerMessage accepted: %s", requested_message)
-        asyncio.create_task(self._handle_triggered_message(requested_message, connector_id))
-        return call_result.TriggerMessagePayload(
-            status=TriggerMessageStatus.accepted
-        )
+        self._spawn(self._handle_triggered_message(requested_message, connector_id))
+        return call_result.TriggerMessagePayload(status=TriggerMessageStatus.accepted)
 
     async def _handle_triggered_message(self, message: str, connector_id: int) -> None:
         """Execute the triggered message after returning the response."""
@@ -518,10 +660,12 @@ class ChargePoint(BaseChargePoint):
             elif message == "Heartbeat":
                 await self.call(call.HeartbeatPayload())
             elif message == "BootNotification":
-                await self.call(call.BootNotificationPayload(
-                    charge_point_model="",
-                    charge_point_vendor="",
-                ))
+                await self.call(
+                    call.BootNotificationPayload(
+                        charge_point_model="",
+                        charge_point_vendor="",
+                    )
+                )
         except Exception:
             logger.warning("Failed to send triggered %s", message, exc_info=True)
 
@@ -530,24 +674,30 @@ class ChargePoint(BaseChargePoint):
         """Handle ChangeAvailability: server requests connector operative/inoperative."""
         logger.info("ChangeAvailability: connector=%d type=%s", connector_id, type)
 
+        if connector_id not in (0, self.connector_id):
+            return call_result.ChangeAvailabilityPayload(
+                status=AvailabilityStatus.rejected
+            )
         if type == AvailabilityType.inoperative:
             if self._transaction_id is not None:
-                logger.info("Transaction active, will change availability after completion")
+                self._pending_inoperative = True
+                logger.info(
+                    "Transaction active, will change availability after completion"
+                )
                 return call_result.ChangeAvailabilityPayload(
                     status=AvailabilityStatus.scheduled
                 )
             self.state = ChargePointStatus.unavailable
             self._shared_state.state = self.state
-            await self.send_status()
+            self._spawn(self.send_status())
         else:
+            self._pending_inoperative = False
             if self.state == ChargePointStatus.unavailable:
                 self.state = ChargePointStatus.available
                 self._shared_state.state = self.state
-                await self.send_status()
+                self._spawn(self.send_status())
 
-        return call_result.ChangeAvailabilityPayload(
-            status=AvailabilityStatus.accepted
-        )
+        return call_result.ChangeAvailabilityPayload(status=AvailabilityStatus.accepted)
 
     @on(Action.UnlockConnector)
     async def on_unlock_connector(self, connector_id: int, **kwargs):
@@ -555,56 +705,48 @@ class ChargePoint(BaseChargePoint):
         logger.info("UnlockConnector: connector=%d", connector_id)
 
         if connector_id != self.connector_id:
-            return call_result.UnlockConnectorPayload(
-                status=UnlockStatus.not_supported
-            )
+            return call_result.UnlockConnectorPayload(status=UnlockStatus.not_supported)
 
+        self.invalidate_pending_start()
         if self._transaction_id is not None:
-            asyncio.create_task(self._do_stop_transaction(
-                final_state=ChargePointStatus.available
-            ))
+            self._spawn(
+                self._do_stop_transaction(final_state=ChargePointStatus.available)
+            )
 
         self._shared_state.plugged_in = False
         self.state = ChargePointStatus.available
         self._shared_state.state = self.state
 
-        return call_result.UnlockConnectorPayload(
-            status=UnlockStatus.unlocked
-        )
+        return call_result.UnlockConnectorPayload(status=UnlockStatus.unlocked)
 
     @on(Action.Reset)
     async def on_reset(self, type: str, **kwargs):
         """Handle Reset: server requests a hard or soft reset."""
         logger.info("Reset requested: type=%s", type)
 
-        if self._transaction_id is not None:
-            await self._do_stop_transaction(final_state=ChargePointStatus.available)
-
-        self._profile_scheduler.clear_profile()
-
-        if type == ResetType.hard:
-            asyncio.create_task(self._perform_hard_reset())
-        else:
-            self.state = ChargePointStatus.available
-            self._shared_state.state = self.state
-            self._shared_state.plugged_in = False
-            self._zero_power_state()
-            await self.send_status()
-
+        self.invalidate_pending_start()
+        self._spawn(self._reset(type))
         return call_result.ResetPayload(status=ResetStatus.accepted)
 
-    async def _perform_hard_reset(self) -> None:
-        """Simulate a hard reset by triggering reconnection."""
-        await asyncio.sleep(2)
-        raise SystemExit("Hard reset requested by server")
+    async def _reset(self, reset_type):
+        if self._transaction_id is not None:
+            await self._do_stop_transaction(final_state=ChargePointStatus.available)
+        self._profile_scheduler.clear_profile()
+        self.state = ChargePointStatus.available
+        self._shared_state.state = self.state
+        self._shared_state.plugged_in = False
+        self._zero_power_state()
+        if reset_type == ResetType.hard:
+            await asyncio.sleep(2)
+            await self._connection.close(code=1012, reason="Charger reset")
+        else:
+            await self.send_status()
 
     @on(Action.ClearCache)
     async def on_clear_cache(self, **kwargs):
         """Handle ClearCache: server requests clearing the authorization cache."""
         logger.info("ClearCache requested")
-        return call_result.ClearCachePayload(
-            status=ClearCacheStatus.accepted
-        )
+        return call_result.ClearCachePayload(status=ClearCacheStatus.accepted)
 
     @on(Action.DataTransfer)
     async def on_data_transfer(
@@ -613,7 +755,9 @@ class ChargePoint(BaseChargePoint):
         """Handle DataTransfer: vendor-specific messaging."""
         logger.info(
             "DataTransfer: vendor=%s message_id=%s data_len=%d",
-            vendor_id, message_id, len(data) if data else 0,
+            vendor_id,
+            message_id,
+            len(data) if data else 0,
         )
         return call_result.DataTransferPayload(
             status=DataTransferStatus.unknown_vendor_id,
