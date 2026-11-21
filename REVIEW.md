@@ -30,7 +30,9 @@ The unchanged public base passes **52 app tests**, with **49%** combined line/br
 coverage and no companion runtime suite. The refreshed app passes **124 tests**
 with **77%** combined line/branch coverage. The companion passes **13 tests** using
 Home Assistant **2026.11.1** classes, with **74%** combined coverage. These are
-local measurements, not a claim that all behavior is covered. Both refreshed
+local measurements, not a claim that all behavior is covered. Six additional
+workflow-metadata regression cases cover quoted helper outputs, unavailable
+architectures and PR-versus-release behavior. Both refreshed
 Alpine 3.24 images build locally and pass all 124 app tests inside their respective
 aarch64/amd64 Python 3.13 containers (77.01% combined coverage).
 

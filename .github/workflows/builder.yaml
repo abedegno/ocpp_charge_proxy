@@ -104,19 +104,30 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [[ -z "$INFO_IMAGE" || "$INFO_IMAGE" == "null" ]]; then
-            echo "build_arch=false" >> "$GITHUB_OUTPUT"
-          elif [[ "$INFO_ARCHITECTURES" == *"$TARGET_ARCH"* ]]; then
-            {
-              echo "build_arch=true"
-              echo "image=${INFO_IMAGE##*/}"
-            } >> "$GITHUB_OUTPUT"
-            if [[ -z "$HEAD_REF" && "$EVENT_NAME" == "push" ]]; then
-              echo "BUILD_ARGS=" >> "$GITHUB_ENV"
-            fi
-          else
-            echo "build_arch=false" >> "$GITHUB_OUTPUT"
-          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          def decode(value):
+              try:
+                  return json.loads(value)
+              except json.JSONDecodeError:
+                  return value
+          image = decode(os.environ["INFO_IMAGE"])
+          architectures = decode(os.environ["INFO_ARCHITECTURES"])
+          if isinstance(architectures, str):
+              architectures = architectures.split()
+          name = image.rsplit("/", 1)[-1] if isinstance(image, str) else ""
+          valid = bool(name and name != "null" and re.fullmatch(r"[a-z0-9_.{}-]+", name)
+              and isinstance(architectures, list) and os.environ["TARGET_ARCH"] in architectures)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("build_arch=" + str(valid).lower() + "\n")
+              if valid:
+                  output.write("image=" + name + "\n")
+          if valid and not os.environ["HEAD_REF"] and os.environ["EVENT_NAME"] == "push":
+              with open(os.environ["GITHUB_ENV"], "a") as output:
+                  output.write("BUILD_ARGS=\n")
+          PY
 
       - name: Login to GitHub Container Registry
         if: env.BUILD_ARGS != '--test'

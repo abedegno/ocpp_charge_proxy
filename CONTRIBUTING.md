@@ -5,7 +5,7 @@
 - `ocpp_charge_proxy/`: independently running HA OS app, Python source, app tests,
   Dockerfile, s6 scripts, configuration and user documentation.
 - `custom_components/ocpp_charge_proxy/`: companion integration, loaded by Core.
-- `tests/`: companion tests using actual Home Assistant classes.
+- `tests/`: companion tests using actual Home Assistant classes and build-workflow regressions.
 - `.github/workflows/`: reusable tests, app lint and image builds.
 
 Keep the emulator and companion integration when extending relay functionality.
